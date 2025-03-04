@@ -11,12 +11,14 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-
-#include "driver/gpio.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_tls.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -24,32 +26,106 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
+#include "version.h"
+
 #define CONFIG_ESP_WIFI_SSID      "lab-iot"
 #define CONFIG_ESP_WIFI_PASS      "IoT-IoT-IoT"
 #define CONFIG_ESP_MAXIMUM_RETRY  5
 #define CONFIG_LOCAL_PORT         10001
 
-#define CONFIG_PEER_IP_ADDR     "192.168.89.abc"
-#define CONFIG_PEER_PORT        10002
+//TODO: Modificati adresa IP de mai jos pentru a coincide cu cea a PC-ul pe care rulati scriptul python
+#define CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL "https://192.168.89.43:5000/firmware.bin" 
 
-//GPIO for LED
 #define GPIO_OUTPUT_IO 4
 #define GPIO_OUTPUT_PIN_SEL (1ULL<<GPIO_OUTPUT_IO)
-
+#define GPIO_INPUT_IO 2
+#define GPIO_INPUT_PIN_SEL (1ULL<<GPIO_INPUT_IO)
+#define MAX_HTTP_OUTPUT_BUFFER 2048
+#define MAX_HTTP_RECV_BUFFER 512
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
-
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static const char *TAG = "wifi station";
+static EventGroupHandle_t s_event_start_ota;
+#define BIT_BTN_PRESSED    BIT0
+
+static const char *TAG = "simple_ota_example";
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
 static int s_retry_num = 0;
 
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    static char *output_buffer;  // Buffer to store response of http request from event handler
+    static int output_len;       // Stores number of bytes read
+    switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        // Clean the buffer in case of a new request
+        if (output_len == 0 && evt->user_data) {
+            // we are just starting to copy the output data into the use
+            memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
+        }
+        /*
+        *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+        *  However, event handler can also be used in case chunked encoding is used.
+        */
+        if (!esp_http_client_is_chunked_response(evt->client)) {
+            // If user_data buffer is configured, copy the response into the buffer
+            int copy_len = 0;
+            if (evt->user_data) {
+                // The last byte in evt->user_data is kept for the NULL character in case of out-of-bound access.
+                copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
+                if (copy_len) {
+                    memcpy(evt->user_data + output_len, evt->data, copy_len);
+                }
+            } else {
+                int content_len = esp_http_client_get_content_length(evt->client);
+                if (output_buffer == NULL) {
+                    // We initialize output_buffer with 0 because it is used by strlen() and similar functions therefore should be null terminated.
+                    output_buffer = (char *) calloc(content_len + 1, sizeof(char));
+                    output_len = 0;
+                    if (output_buffer == NULL) {
+                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+                }
+                copy_len = MIN(evt->data_len, (content_len - output_len));
+                if (copy_len) {
+                    memcpy(output_buffer + output_len, evt->data, copy_len);
+                }
+            }
+            output_len += copy_len;
+        }
+
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
+        break;
+    case HTTP_EVENT_REDIRECT:
+        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+        break;
+    }
+    return ESP_OK;
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -133,87 +209,82 @@ bool wifi_init_sta(void)
     return false;
 }
 
-static void udp_task(void *pvParameters)
+static void ota_task(void *pvParameters)
 {
-    char rx_buffer[128];
-    char addr_str[128];
-    int addr_family = 0;
-    int ip_protocol = 0;
+    xEventGroupWaitBits(s_event_start_ota, BIT_BTN_PRESSED, pdTRUE, pdTRUE, portMAX_DELAY);
 
+    char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
+    ESP_LOGI(TAG, "Starting OTA example task");
+    esp_http_client_config_t config = {
+        .url = CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL,
+        .cert_pem = (char *)server_cert_pem_start,
+        .cert_len = 1422,
+        .event_handler = _http_event_handler,
+        .keep_alive_enable = true,
+        .use_global_ca_store = true,
+        .user_data = local_response_buffer,
+        .skip_cert_common_name_check = true
+    };
+
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config,
+    };
     
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(CONFIG_PEER_IP_ADDR); // unde #define CONFIG_PEER_IP_ADDR "192.168.89.abc"
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(CONFIG_PEER_PORT);
-    addr_family = AF_INET;
-    ip_protocol = IPPROTO_IP;
-    
-    struct sockaddr_in local_addr;
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(CONFIG_LOCAL_PORT);
-    ip_protocol = IPPROTO_IP;
-    addr_family = AF_INET;
+    ESP_ERROR_CHECK(esp_tls_init_global_ca_store());
+    ESP_ERROR_CHECK(esp_tls_set_global_ca_store((unsigned char*)server_cert_pem_start, server_cert_pem_end - server_cert_pem_start));
+
+    ESP_LOGI(TAG, "Attempting to download update from %s", config.url);
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA Succeed, Rebooting...");
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "Firmware upgrade failed");
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %"PRId64,
+                esp_http_client_get_status_code(client),
+                esp_http_client_get_content_length(client));
+    } else {
+        ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+    }
+    while (1) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+static void button_task(void * pvParameter)
+{
+    uint8_t u8Count = 5;
+    int val = 1;
 
     while(1)
     {
-        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            break;
-        }
-        ESP_LOGI(TAG, "Socket created");
+        if (gpio_get_level(GPIO_INPUT_IO) != val)
+            u8Count--;
+        else
+            u8Count = 5;
 
-        int err = bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr));
-        if (err < 0) {
-            ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        }
-        ESP_LOGI(TAG, "Socket bound, port %d", CONFIG_LOCAL_PORT);
-
-
-
-        while (1) {
-
-            struct sockaddr source_addr;
-            socklen_t socklen = sizeof(source_addr);
-
-            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, &source_addr, &socklen);
-
-            // Error occurred during receiving
-            if (len < 0) {
-                ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
-                break;
+        if(!u8Count) {
+            val = gpio_get_level(GPIO_INPUT_IO);
+            
+            if(!gpio_get_level(GPIO_INPUT_IO)){
+                ESP_LOGI(TAG, "Button pressed");
+                xEventGroupSetBits(s_event_start_ota, BIT_BTN_PRESSED);
+                val = gpio_get_level(GPIO_INPUT_IO);
             }
-            // Data received
-            else {
-                inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-                rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string
-                ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
-                ESP_LOGI(TAG, "%s", rx_buffer);
-                //punctul 2
-                if(rx_buffer[len-1] == '0'){
-                    gpio_set_level(GPIO_OUTPUT_IO, 0);
-                }
-                else if (rx_buffer[len-1] == '1'){
-                    gpio_set_level(GPIO_OUTPUT_IO, 1);
-                }
-            }
-
-            vTaskDelay(200 / portTICK_PERIOD_MS);
         }
 
-        if (sock != -1) {
-            ESP_LOGE(TAG, "Shutting down socket and restarting...");
-            shutdown(sock, 0);
-            close(sock);
-        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
-    vTaskDelete(NULL);
 }
 
-void app_main(void)
+void gpio_init()
 {
-    //Initialize GPIO
     //zero-initialize the config structure.
     gpio_config_t io_conf = {};
     //disable interrupt
@@ -228,7 +299,15 @@ void app_main(void)
     io_conf.pull_up_en = 0;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
-        
+
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+}
+
+void app_main(void)
+{
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -237,10 +316,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    gpio_init();
+
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     bool connected = wifi_init_sta();
 
     if (connected) {
-        xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
+        s_event_start_ota = xEventGroupCreate();
+        xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
+        xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
     }
 }
