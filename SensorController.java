@@ -1,55 +1,40 @@
-package com.example.proiect_iot.sensorsservice;
+package com.iot.auth.controller;
 
+import com.iot.auth.security.JwtUtil;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.io.IOException;
 
 @RestController
-@RequestMapping("/sensors")
+@RequestMapping("/sensor")
 public class SensorController {
+    private final JwtUtil jwtUtil;
 
-    private final SensorService service;
-
-    public SensorController(SensorService service) {
-        this.service = service;
+    public SensorController(JwtUtil jwtUtil) {
+        this.jwtUtil = jwtUtil;
     }
 
-    @GetMapping("/{id}")
-    public ResponseEntity<String> readSensorValue(@PathVariable String id) {
-        try {
-            double value = service.getSensorValue(id);
-            return ResponseEntity.ok("Senzor:" + value);
-        } catch (IllegalArgumentException e) {
-            return ResponseEntity.status(404).body("Senzor negasit: " + id);
+    @GetMapping("/{sensorId}")
+    public ResponseEntity<?> readSensor(@PathVariable String sensorId, HttpServletRequest request) {
+        String role = jwtUtil.extractRole(request);
+        if (role.equals("owner") || role.equals("admin")) {
+            return ResponseEntity.ok("Senzor " + sensorId + " cu valoarea: " + Math.random() * 100);
         }
+        return ResponseEntity.status(403).body("Acces interzis!!");
     }
 
-    @PostMapping("/{id}/config")
-    public ResponseEntity<String> createConfig(@PathVariable String id) throws IOException {
-        if (!SensorSimulator.exists(id)) {
-            return ResponseEntity.status(406).body("Senzor ID invalid: " + id);
-        }
-
-        if (service.createConfig(id)) {
-            return ResponseEntity.ok("Senzor: " + id);
-        } else {
-            return ResponseEntity.status(409).body("Config deja existent pentru senzor:" + id);
-        }
+    @PostMapping("/{sensorId}")
+    public ResponseEntity<?> createConfig(@PathVariable String sensorId, HttpServletRequest request) {
+        String role = jwtUtil.extractRole(request);
+        if (!role.equals("admin")) return ResponseEntity.status(403).body("Acces interzis!!");
+        return ResponseEntity.ok("Config pt senzorul " + sensorId + " creat");
     }
 
-    @PutMapping("/{id}/config/{filename}")
-    public ResponseEntity<String> updateConfig(@PathVariable String id,
-                                               @PathVariable String filename,
-                                               @RequestBody String newContent) throws IOException {
-        if (!SensorSimulator.exists(id)) {
-            return ResponseEntity.status(406).body("Sensor ID invalid: " + id);
-        }
-
-        if (service.replaceConfig(id, filename, newContent)) {
-            return ResponseEntity.ok("Config updated: " + filename);
-        } else {
-            return ResponseEntity.status(400).body("Config file not found: " + filename);
-        }
+    @PutMapping("/{sensorId}/{configName}")
+    public ResponseEntity<?> updateConfig(@PathVariable String sensorId, @PathVariable String configName, HttpServletRequest request) {
+        String role = jwtUtil.extractRole(request);
+        if (!role.equals("admin")) return ResponseEntity.status(403).body("Acces interzis!!");
+        return ResponseEntity.ok("Config " + configName + " pt senzorul " + sensorId + " updatat");
     }
 }
